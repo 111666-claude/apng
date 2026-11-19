@@ -87,6 +87,30 @@ func ExampleDecodeAll() {
 	}
 }
 
+func ExampleFrameReader() {
+	fr, err := apng.NewFrameReader(gopherPNG())
+	if err != nil {
+		panic(err)
+	}
+	defer fr.Close()
+
+	println("animation:", fr.IsAnimation(), "frames:", fr.NumFrames())
+
+	// Each frame may be dropped once the next one is requested, so a long
+	// animation does not need to be held in memory at once.
+	for {
+		frame, err := fr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			panic(err)
+		}
+		b := frame.Image.Bounds()
+		println("frame", frame.Sequence, b.Dx(), b.Dy(), frame.GetDelay())
+	}
+}
+
 func ExampleEncode() {
 	w, h := 200, 200
 	am := apng.APNG{Frames: make([]apng.Frame, 20)}

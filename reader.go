@@ -55,6 +55,32 @@ func cbPaletted(cb int) bool {
 	return cbP1 <= cb && cb <= cbP8
 }
 
+// pixelStorageBytes returns the number of bytes per pixel used by the in-memory
+// image that readImagePass allocates for the given color type. It is generally
+// larger than the on-disk size; a 24-bit truecolor image, for example, is
+// decoded into a 4 byte per pixel image.RGBA.
+func pixelStorageBytes(cb int, useTransparent bool) int64 {
+	switch cb {
+	case cbG1, cbG2, cbG4, cbG8:
+		if useTransparent {
+			return 4
+		}
+		return 1
+	case cbP1, cbP2, cbP4, cbP8:
+		return 1
+	case cbGA8, cbTC8, cbTCA8:
+		return 4
+	case cbG16:
+		if useTransparent {
+			return 8
+		}
+		return 2
+	case cbGA16, cbTC16, cbTCA16:
+		return 8
+	}
+	return 8
+}
+
 // Filter type, as per the PNG spec.
 const (
 	ftNone    = 0
@@ -111,6 +137,7 @@ type decoder struct {
 	numFrames     uint32
 	a             APNG
 	frameIndex    int
+	cur           *Frame
 	crc           hash.Hash32
 	width, height int
 	depth         int
@@ -121,10 +148,71 @@ type decoder struct {
 	tmp           [3 * 256]byte
 	interlace     int
 
+	// maxFrameBytes bounds the memory used for a single frame's decoded
+	// pixel buffer. A non-positive value disables the limit; this is the
+	// case for DecodeAll and Decode, whose behavior must not change.
+	maxFrameBytes int64
+
+	// strict enables the additional format checks that FrameReader performs
+	// on top of what DecodeAll has historically accepted: APNG sequence
+	// numbers, frame dimensions and frame placement on the canvas.
+	strict bool
+	// seqExpected is the next expected APNG sequence number in strict mode.
+	seqExpected uint32
+	// stream indicates that only the frame in cur is retained. It is set by
+	// NewFrameReader; DecodeAll and Decode leave it false.
+	stream bool
+	// pendingFcTL reports whether cur was described by an fcTL chunk that has
+	// not yet produced a complete frame.
+	pendingFcTL bool
+	// seenACTL reports whether an acTL chunk has been read.
+	seenACTL bool
+	// fcTLCount is the number of fcTL chunks read in stream mode.
+	fcTLCount uint32
+
 	// useTransparent and transparent are used for grayscale and truecolor
 	// transparency, as opposed to palette transparency.
 	useTransparent bool
 	transparent    [6]byte
+}
+
+// A chunkHeader is the 8 byte prefix of a PNG chunk: a 4 byte big-endian
+// length followed by the 4 byte chunk type.
+type chunkHeader struct {
+	length uint32
+	typ    string
+}
+
+// readChunkHeader reads a chunk header and initializes the CRC state with the
+// chunk type, leaving d.r positioned at the chunk data.
+func (d *decoder) readChunkHeader() (chunkHeader, error) {
+	if _, err := io.ReadFull(d.r, d.tmp[:8]); err != nil {
+		return chunkHeader{}, err
+	}
+	d.crc.Reset()
+	d.crc.Write(d.tmp[4:8])
+	return chunkHeader{
+		length: binary.BigEndian.Uint32(d.tmp[:4]),
+		typ:    string(d.tmp[4:8]),
+	}, nil
+}
+
+// skipChunk consumes and verifies the data and checksum of a chunk whose
+// header has already been read by readChunkHeader.
+func (d *decoder) skipChunk(length uint32) error {
+	if length > 0x7fffffff {
+		return FormatError(fmt.Sprintf("Bad chunk length: %d", length))
+	}
+	var ignored [4096]byte
+	for length > 0 {
+		n, err := io.ReadFull(d.r, ignored[:min(len(ignored), int(length))])
+		if err != nil {
+			return err
+		}
+		d.crc.Write(ignored[:n])
+		length -= uint32(n)
+	}
+	return d.verifyChecksum()
 }
 
 // A FormatError reports that the input is not a valid PNG.
@@ -233,6 +321,7 @@ func (d *decoder) parseIHDR(length uint32) error {
 		return UnsupportedError(fmt.Sprintf("bit depth %d, color type %d", d.tmp[8], d.tmp[9]))
 	}
 	d.a.Frames[0].width, d.a.Frames[0].height = int(w), int(h)
+	d.width, d.height = int(w), int(h)
 	return d.verifyChecksum()
 }
 
@@ -332,7 +421,9 @@ func (d *decoder) parsetRNS(length uint32) error {
 
 // Read presents one or more IDAT chunks as one continuous stream (minus the
 // intermediate chunk headers and footers). If the PNG data looked like:
-//   ... len0 IDAT xxx crc0 len1 IDAT yy crc1 len2 IEND crc2
+//
+//	... len0 IDAT xxx crc0 len1 IDAT yy crc1 len2 IEND crc2
+//
 // then this reader presents xxxyy. For well-formed PNG data, the decoder state
 // immediately before the first Read call is that d.r is positioned between the
 // first IDAT and xxx, and the decoder state immediately after the last Read
@@ -358,7 +449,11 @@ func (d *decoder) Read(p []byte) (int, error) {
 				return 0, FormatError(fmt.Sprintf("expected IDAT, found %s", string(d.tmp[4:8])))
 			}
 		} else {
-			d.idatLength = binary.BigEndian.Uint32(d.tmp[:4]) - 4
+			length := binary.BigEndian.Uint32(d.tmp[:4])
+			if d.strict && length < 4 {
+				return 0, FormatError("bad fdAT length")
+			}
+			d.idatLength = length - 4
 			if string(d.tmp[4:8]) != "fdAT" {
 				return 0, FormatError(fmt.Sprintf("expected fdAT, found %s", string(d.tmp[4:8])))
 			}
@@ -367,6 +462,9 @@ func (d *decoder) Read(p []byte) (int, error) {
 		d.crc.Write(d.tmp[4:8])
 		if d.stage >= dsSeenfdAT {
 			if _, err := io.ReadFull(d.r, d.tmp[:4]); err != nil {
+				return 0, err
+			}
+			if err := d.checkSequence(binary.BigEndian.Uint32(d.tmp[:4])); err != nil {
 				return 0, err
 			}
 			d.crc.Write(d.tmp[:4])
@@ -429,6 +527,23 @@ func (d *decoder) decode() (image.Image, error) {
 	return img, nil
 }
 
+// targetFrame returns the Frame that the decoder is currently filling. For
+// DecodeAll and Decode this is the frame at frameIndex in the accumulated
+// APNG; a FrameReader sets stream and instead uses cur, so that frames which
+// have already been consumed are not retained.
+func (d *decoder) targetFrame() *Frame {
+	if d.stream {
+		if d.cur == nil {
+			d.cur = &Frame{}
+		}
+		return d.cur
+	}
+	if d.frameIndex >= len(d.a.Frames) {
+		d.a.Frames = append(d.a.Frames, Frame{})
+	}
+	return &d.a.Frames[d.frameIndex]
+}
+
 // readImagePass reads a single image pass, sized according to the pass number.
 func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image.Image, error) {
 	bitsPerPixel := 0
@@ -445,8 +560,9 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 		width    int
 		height   int
 	)
-	width = d.a.Frames[d.frameIndex].width
-	height = d.a.Frames[d.frameIndex].height
+	f := d.targetFrame()
+	width = f.width
+	height = f.height
 	if d.interlace == itAdam7 && !allocateOnly {
 		p := interlacing[pass]
 		// Add the multiplication factor and subtract one, effectively rounding up.
@@ -457,6 +573,24 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 		// shouldn't even read a per-row filter type byte, so return early.
 		if width == 0 || height == 0 {
 			return nil, nil
+		}
+	}
+	if d.maxFrameBytes > 0 {
+		// Reject before allocating anything. The division form avoids an
+		// overflow in width*height*bpp.
+		if width <= 0 || height <= 0 {
+			return nil, FormatError("non-positive frame dimension")
+		}
+		bpp := pixelStorageBytes(d.cb, d.useTransparent)
+		// An interlaced frame allocates a full-size image plus one image per
+		// Adam7 pass; the passes together cover every pixel once, so double
+		// the per-pixel figure to bound the total.
+		if d.interlace == itAdam7 {
+			bpp *= 2
+		}
+		if int64(width) > d.maxFrameBytes/int64(height)/bpp {
+			return nil, fmt.Errorf("%w: %dx%d frame needs more than %d bytes of pixel storage",
+				ErrFrameTooLarge, width, height, d.maxFrameBytes)
 		}
 	}
 	switch d.cb {
@@ -891,6 +1025,38 @@ func (d *decoder) parseacTL(length uint32) (err error) {
 	return d.verifyChecksum()
 }
 
+// checkSequence verifies an APNG sequence number when the decoder is running
+// in strict mode. Sequence numbers must start at zero and increase by one for
+// every fcTL and fdAT chunk.
+func (d *decoder) checkSequence(seq uint32) error {
+	if !d.strict {
+		return nil
+	}
+	if seq != d.seqExpected {
+		return FormatError(fmt.Sprintf("unexpected sequence number %d, expected %d", seq, d.seqExpected))
+	}
+	d.seqExpected++
+	return nil
+}
+
+// validateFrame checks that frame metadata read from fcTL is usable and stays
+// within the image canvas. DecodeAll and Decode do not enforce these checks,
+// matching their historical behavior.
+func (d *decoder) validateFrame(f *Frame) error {
+	if !d.strict {
+		return nil
+	}
+	if f.width <= 0 || f.height <= 0 {
+		return FormatError("non-positive frame dimension")
+	}
+	if f.XOffset < 0 || f.YOffset < 0 ||
+		int64(f.XOffset)+int64(f.width) > int64(d.width) ||
+		int64(f.YOffset)+int64(f.height) > int64(d.height) {
+		return FormatError("frame outside image bounds")
+	}
+	return nil
+}
+
 func (d *decoder) parsefcTL(length uint32) (err error) {
 	if length != 26 {
 		return FormatError("bad fcTL length")
@@ -899,31 +1065,45 @@ func (d *decoder) parsefcTL(length uint32) (err error) {
 		return err
 	}
 
-	if d.frameIndex >= len(d.a.Frames) {
-		d.a.Frames = append(d.a.Frames, Frame{})
+	// The frame control chunk is the only place frame metadata is stored;
+	// the image data chunks that follow carry pixels only.
+	if err := d.checkSequence(binary.BigEndian.Uint32(d.tmp[0:4])); err != nil {
+		return err
 	}
 
-	d.a.Frames[d.frameIndex].IsDefault = false
-	d.a.Frames[d.frameIndex].width = int(int32(binary.BigEndian.Uint32(d.tmp[4:8])))
-	d.a.Frames[d.frameIndex].height = int(int32(binary.BigEndian.Uint32(d.tmp[8:12])))
-	d.a.Frames[d.frameIndex].XOffset = int(binary.BigEndian.Uint32(d.tmp[12:16]))
-	d.a.Frames[d.frameIndex].YOffset = int(binary.BigEndian.Uint32(d.tmp[16:20]))
-	d.a.Frames[d.frameIndex].DelayNumerator = binary.BigEndian.Uint16(d.tmp[20:22])
-	d.a.Frames[d.frameIndex].DelayDenominator = binary.BigEndian.Uint16(d.tmp[22:24])
-	d.a.Frames[d.frameIndex].DisposeOp = d.tmp[24]
-	d.a.Frames[d.frameIndex].BlendOp = d.tmp[25]
+	f := d.targetFrame()
+	f.IsDefault = false
+	f.Sequence = binary.BigEndian.Uint32(d.tmp[0:4])
+	f.width = int(int32(binary.BigEndian.Uint32(d.tmp[4:8])))
+	f.height = int(int32(binary.BigEndian.Uint32(d.tmp[8:12])))
+	f.XOffset = int(binary.BigEndian.Uint32(d.tmp[12:16]))
+	f.YOffset = int(binary.BigEndian.Uint32(d.tmp[16:20]))
+	f.DelayNumerator = binary.BigEndian.Uint16(d.tmp[20:22])
+	f.DelayDenominator = binary.BigEndian.Uint16(d.tmp[22:24])
+	f.DisposeOp = d.tmp[24]
+	f.BlendOp = d.tmp[25]
+	if err := d.validateFrame(f); err != nil {
+		return err
+	}
 
 	d.crc.Write(d.tmp[:26])
 	return d.verifyChecksum()
 }
 
 func (d *decoder) parsefdAT(length uint32) (err error) {
+	if d.strict && length < 4 {
+		return FormatError("bad fdAT length")
+	}
 	if _, err := io.ReadFull(d.r, d.tmp[:4]); err != nil {
+		return err
+	}
+	if err := d.checkSequence(binary.BigEndian.Uint32(d.tmp[:4])); err != nil {
 		return err
 	}
 	d.crc.Write(d.tmp[:4])
 	d.idatLength = length - 4
-	d.a.Frames[d.frameIndex].Image, err = d.decode()
+	f := d.targetFrame()
+	f.Image, err = d.decode()
 	if err != nil {
 		return err
 	}
@@ -932,7 +1112,8 @@ func (d *decoder) parsefdAT(length uint32) (err error) {
 
 func (d *decoder) parseIDAT(length uint32) (err error) {
 	d.idatLength = length
-	d.a.Frames[d.frameIndex].Image, err = d.decode()
+	f := d.targetFrame()
+	f.Image, err = d.decode()
 	if err != nil {
 		return err
 	}
@@ -946,89 +1127,138 @@ func (d *decoder) parseIEND(length uint32) error {
 	return d.verifyChecksum()
 }
 
+// parseChunk reads and processes one chunk.
 func (d *decoder) parseChunk() error {
-	// Read the length and chunk type.
-	if _, err := io.ReadFull(d.r, d.tmp[:8]); err != nil {
-		return err
+	_, err := d.parseChunkType()
+	return err
+}
+
+// parseChunkType reads and processes one chunk and returns its type. It is
+// used by FrameReader to drive the stream one chunk at a time.
+func (d *decoder) parseChunkType() (string, error) {
+	h, err := d.readChunkHeader()
+	if err != nil {
+		return "", err
 	}
-	length := binary.BigEndian.Uint32(d.tmp[:4])
-	d.crc.Reset()
-	d.crc.Write(d.tmp[4:8])
+	return d.processChunk(h)
+}
+
+// processChunk processes a chunk whose header has already been read by
+// readChunkHeader, which also initialized the CRC with the chunk type.
+func (d *decoder) processChunk(h chunkHeader) (string, error) {
+	length, typ := h.length, h.typ
 
 	// Read the chunk data.
-	switch string(d.tmp[4:8]) {
+	switch typ {
 	case "IHDR":
 		if d.stage != dsStart {
-			return chunkOrderError
+			return typ, chunkOrderError
 		}
 		d.stage = dsSeenIHDR
-		return d.parseIHDR(length)
+		return typ, d.parseIHDR(length)
 	case "PLTE":
 		if d.stage != dsSeenIHDR {
-			return chunkOrderError
+			return typ, chunkOrderError
 		}
 		d.stage = dsSeenPLTE
-		return d.parsePLTE(length)
+		return typ, d.parsePLTE(length)
 	case "tRNS":
 		if cbPaletted(d.cb) {
 			if d.stage != dsSeenPLTE {
-				return chunkOrderError
+				return typ, chunkOrderError
 			}
 		} else if d.stage != dsSeenIHDR {
-			return chunkOrderError
+			return typ, chunkOrderError
 		}
 		d.stage = dsSeentRNS
-		return d.parsetRNS(length)
+		return typ, d.parsetRNS(length)
 	case "acTL":
 		if d.stage >= dsSeenIDAT {
-			return chunkOrderError
+			return typ, chunkOrderError
 		}
-		return d.parseacTL(length)
+		if d.strict && d.seenACTL {
+			return typ, FormatError("duplicate acTL chunk")
+		}
+		if err := d.parseacTL(length); err != nil {
+			return typ, err
+		}
+		d.seenACTL = true
+		return typ, nil
 	case "fcTL":
+		if d.strict && !d.seenACTL {
+			return typ, FormatError("fcTL without acTL")
+		}
 		if d.stage >= dsSeenIDAT {
 			d.frameIndex = d.frameIndex + 1
 		}
-		return d.parsefcTL(length)
+		if d.stream {
+			// A frame control chunk always begins a new frame. If the previous
+			// frame control chunk never received image data, the input is
+			// truncated.
+			if d.pendingFcTL {
+				return typ, FormatError("truncated frame: fcTL without image data")
+			}
+			d.cur = nil
+		}
+		if err := d.parsefcTL(length); err != nil {
+			return typ, err
+		}
+		if d.stream {
+			d.fcTLCount++
+			d.pendingFcTL = true
+		}
+		return typ, nil
 	case "fdAT":
 		if d.stage < dsSeenIDAT {
-			return chunkOrderError
+			return typ, chunkOrderError
+		}
+		if d.stream && !d.pendingFcTL {
+			return typ, FormatError("fdAT without preceding fcTL")
 		}
 		d.stage = dsSeenfdAT
-		return d.parsefdAT(length)
+		err := d.parsefdAT(length)
+		if err == nil && d.stream {
+			d.pendingFcTL = false
+		}
+		return typ, err
 	case "IDAT":
 		if d.stage < dsSeenIHDR || d.stage > dsSeenIDAT || (d.stage == dsSeenIHDR && cbPaletted(d.cb)) {
-			return chunkOrderError
+			return typ, chunkOrderError
 		} else if d.stage == dsSeenIDAT {
 			// Ignore trailing zero-length or garbage IDAT chunks.
 			//
 			// This does not affect valid PNG images that contain multiple IDAT
 			// chunks, since the first call to parseIDAT below will consume all
 			// consecutive IDAT chunks required for decoding the image.
-			break
+			return typ, d.skipChunk(length)
+		}
+		if d.stream && d.cur == nil {
+			// The image data is not preceded by an fcTL chunk, so it is the
+			// default image and does not form part of the animation.
+			d.cur = &Frame{width: d.width, height: d.height, IsDefault: true}
 		}
 		d.stage = dsSeenIDAT
-		return d.parseIDAT(length)
+		err := d.parseIDAT(length)
+		if err == nil && d.stream {
+			d.pendingFcTL = false
+		}
+		return typ, err
 	case "IEND":
 		if d.stage < dsSeenIDAT {
-			return chunkOrderError
+			return typ, chunkOrderError
+		}
+		if d.stream {
+			if d.pendingFcTL {
+				return typ, FormatError("truncated frame: no image data before IEND")
+			}
+			if d.seenACTL && int(d.fcTLCount) != int(d.numFrames) {
+				return typ, FormatError(fmt.Sprintf("expected %d animation frames, found %d", d.numFrames, d.fcTLCount))
+			}
 		}
 		d.stage = dsSeenIEND
-		return d.parseIEND(length)
+		return typ, d.parseIEND(length)
 	}
-	if length > 0x7fffffff {
-		return FormatError(fmt.Sprintf("Bad chunk length: %d", length))
-	}
-	// Ignore this chunk (of a known length).
-	var ignored [4096]byte
-	for length > 0 {
-		n, err := io.ReadFull(d.r, ignored[:min(len(ignored), int(length))])
-		if err != nil {
-			return err
-		}
-		d.crc.Write(ignored[:n])
-		length -= uint32(n)
-	}
-	return d.verifyChecksum()
+	return typ, d.skipChunk(length)
 }
 
 func (d *decoder) verifyChecksum() error {

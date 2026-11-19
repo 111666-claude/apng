@@ -23,6 +23,7 @@ The Frame type contains an individual frame of an APNG. The following table prov
 |----------------------|-------------------------------------------------------------------------------------------------------------------------------------|
 | Image image.Image    | Frame image data.                                                                                                                   |
 | IsDefault bool       | Indicates if this frame is a default image that should not be included as part of the animation frames. May only be true for the first Frame. |
+| Sequence uint32      | The APNG sequence number of the frame's `fcTL` chunk. The default image has no `fcTL`, so it reports 0; use `IsDefault` to tell them apart. |
 | XOffset int          | Returns the x offset of the frame.                                                                                                  |
 | YOffset int          | Returns the y offset of the frame.                                                                                                  |
 | DelayNumerator int   | Returns the delay numerator.                                                                                                        |
@@ -68,6 +69,68 @@ func main() {
 
 ### Decode(io.Reader) (image.Image, error)
 This method returns the Image of the default frame of an APNG file.
+
+### NewFrameReader(io.Reader) (*FrameReader, error)
+`DecodeAll` keeps every frame in memory at once, which is a problem for long
+animations such as sticker sets. `FrameReader` decodes one frame at a time from
+the stream and lets the caller release each frame before asking for the next.
+
+`NewFrameReader` parses the PNG header and the `acTL` chunk, so `IsAnimation`,
+`NumFrames` and `LoopCount` are available before the first frame is decoded.
+`Next` then returns one `*Frame` at a time, followed by `io.EOF`. The reader
+holds only the frame currently being decoded; `Next` drops its reference to the
+previously returned frame, so frames the caller does not keep are collected.
+
+The default image is reported exactly as `DecodeAll` reports it: a frame with
+`IsDefault` set. If the default image is not part of the animation it becomes
+the first frame returned. A plain PNG yields one `IsDefault` frame and then
+`io.EOF`, with `IsAnimation` false.
+
+```go
+fr, err := apng.NewFrameReader(f)
+if err != nil {
+  panic(err)
+}
+defer fr.Close()
+
+if fr.IsAnimation() {
+  log.Printf("%d frames, loop count %d", fr.NumFrames(), fr.LoopCount())
+}
+for {
+  frame, err := fr.Next()
+  if err == io.EOF {
+    break
+  }
+  if err != nil {
+    panic(err)
+  }
+  preview(frame) // frame.Image is owned by the caller
+}
+```
+
+Errors are explicit and terminal:
+
+- A truncated stream, a chunk out of order, an `fdAT` without a preceding
+  `fcTL`, a bad CRC, or a non-monotonic sequence number produce a
+  `FormatError` (or `io.ErrUnexpectedEOF` for a premature end of input). No
+  partial frame is returned.
+- A frame whose decoded pixel buffer would exceed `MaxFrameBytes` fails with
+  `ErrFrameTooLarge` *before* any pixel buffer is allocated. The check uses the
+  bytes the in-memory image actually needs, which can exceed the on-disk size
+  (8-bit RGB is decoded to 4 bytes per pixel, for example). The default limit is
+  `DefaultMaxFrameBytes` (1 GiB); set `MaxFrameBytes` to a smaller value to cap
+  memory further, or to a negative value to disable the limit. The limit
+  applies per frame, so small frames in a large canvas still pass.
+- A zero delay is not an error. `Frame.GetDelay` returns 0 for a zero
+  numerator, and treats a zero denominator as 100 as the APNG specification
+  requires.
+- Stopping early is just not calling `Next` again. `Close` releases the last
+  frame and makes further `Next` calls return `ErrFrameReaderClosed`; it never
+  closes the underlying reader.
+
+`FrameReader` performs stricter checks than `DecodeAll` on sequence numbers and
+frame placement. `DecodeAll` and `Decode` keep their historical behavior and
+are unchanged.
 
 ### Encode(io.Writer, APNG) error
 This method writes the passed APNG object to the given io.Writer as an APNG binary file.

@@ -29,6 +29,10 @@ type Frame struct {
 	DelayDenominator uint16
 	DisposeOp        byte
 	BlendOp          byte
+	// Sequence is the APNG sequence number of the fcTL chunk that
+	// describes this frame. A default image has no fcTL chunk and
+	// therefore reports 0; use IsDefault to tell the two apart.
+	Sequence uint32
 	// IsDefault indicates if the Frame is a default image that
 	// should not be used in the animation. IsDefault can only
 	// be true on the first frame.
